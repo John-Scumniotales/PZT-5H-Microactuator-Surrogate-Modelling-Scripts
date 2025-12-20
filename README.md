@@ -2,9 +2,9 @@
 
 <img width="1200" height="900" alt="image" src="https://github.com/user-attachments/assets/d17eac18-e28a-4ccc-8b57-c6adbcc714ac" />
 
-This repo contains the **training script + dataset** used for the paper **"Data-Driven Surrogate Modeling for Tileable PZT-5H Piezoelectric Microactuators"**.
+This repo contains the **training script + dataset** used for our paper: **"Data-Driven Surrogate Modeling for Tileable PZT-5H Piezoelectric Microactuators"**.
 A compact GRU encoder-decoder style sequence to sequence surrogate that predicts future displacement futures given short histories of an actuators electromechanical history. 
-This enables fast, accurate, and parralel inference of microactuator behaviour, a stark contrast to its FEM counterpart.
+Our method enables fast, accurate, and parralel inference of microactuator behaviour, a stark contrast to its FEM counterpart.
 
 ## Quickstart
 
