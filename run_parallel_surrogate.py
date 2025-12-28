@@ -1,3 +1,8 @@
+"""
+Script for running batched distributed inference for surrogates
+across multiple GPUs
+"""
+
 import argparse
 import csv
 import time
