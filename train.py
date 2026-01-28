@@ -1,6 +1,4 @@
-"""
-PyTorch training script for PZT-5H microactuator seq2seq surrogate model.
-"""
+import argparse
 import contextlib
 import csv
 import math
@@ -18,22 +16,13 @@ from torch.utils.data import DataLoader, TensorDataset
 
 # Paths
 DATA_DIR = Path("data")
-OUT_PATH = Path("Model")
-CKPT_DIR = OUT_PATH / "checkpoints"
-DATASET_DIR = OUT_PATH / "datasets"
-MODEL_PATH = OUT_PATH / "seq2seq_surrogate.pt"
-BEST_CKPT_PATH = CKPT_DIR / "best_seq2seq.pt"
-LOG_CSV_PATH = OUT_PATH / "training_log.csv"
-NORM_PATH = OUT_PATH / "norm_stats.npz"
-
-for p in (CKPT_DIR, DATASET_DIR):
-    p.mkdir(parents=True, exist_ok=True)
+DEFAULT_OUT_PATH = Path("Model")
 
 # Hyperparameters
-SEQ_LENGTH = 32          # Past timesteps "seen" by encoder
-PRED_HORIZON = 100         # How many future displacements to predict
-BATCH_SIZE = 1024
-EPOCHS = 120
+SEQ_LENGTH = 32          # past timesteps used by the encoder
+PRED_HORIZON = 100         # how many future displacements to predict
+BATCH_SIZE = 256
+EPOCHS = 256
 VAL_SPLIT = 0.1
 LR = 3e-4
 LR_FACTOR = 0.5
@@ -42,14 +31,13 @@ MIN_DELTA = 1e-5
 MIN_LR = 1e-6
 GRAD_CLIP = 1.0
 NUM_WORKERS = 2
-INPUT_DROPOUT = 0.05
-HIDDEN_DROPOUT = 0.1
-AUG_NOISE_STD = 0.005
-# Training Progress Params
-R2_EVAL_EVERY = 5
-R2_MAX_TRAIN_BATCHES = 2500
-R2_MAX_VAL_BATCHES = None # None to evaluate full val set
-MAX_TRAIN_TIME = 23 * 3600  # Train wall time
+INPUT_DROPOUT = 0.05       # dropout on encoder inputs
+HIDDEN_DROPOUT = 0.1      # dropout on decoder hidden outputs
+AUG_NOISE_STD = 0.005      # Gaussian noise on normalized inputs during training
+R2_EVAL_EVERY = 5         # compute train/val R2 every N epochs
+R2_MAX_TRAIN_BATCHES = 2500 # cap train batches for R2 to save time (None for full)
+R2_MAX_VAL_BATCHES = None # use None to evaluate full val set
+MAX_TRAIN_TIME = 23 * 3600  # seconds; stop training after this wall time
 
 
 def set_seed(seed: int = 42) -> None:
@@ -103,7 +91,7 @@ class Seq2SeqForecaster(nn.Module):
         batch_size = src.size(0)
         src = self.in_drop(src)
         _, h = self.encoder(src)
-        # start-of-sequence token (zeroes)
+        # start-of-sequence token is zeros in displacement space
         dec_in = torch.zeros(batch_size, 1, self.out_dim, device=src.device, dtype=src.dtype)
         outputs = []
         for t in range(self.horizon):
@@ -114,7 +102,21 @@ class Seq2SeqForecaster(nn.Module):
         return torch.stack(outputs, dim=1)
 
 
-def prepare_data() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def prepare_data(
+    output_norm: str,
+    dataset_dir: Path,
+    norm_path: Path,
+    num_chunks: int,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
     segments = sorted(d for d in DATA_DIR.iterdir() if d.is_dir())
     feats_list: list[np.ndarray] = []
     disp_list: list[np.ndarray] = []
@@ -124,6 +126,10 @@ def prepare_data() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.n
         v_df = load_disp_raw(seg / "V_Table.txt", "v")
         w_df = load_disp_raw(seg / "W_Table.txt", "w")
         it_df = load_int_raw(seg / "Int_Table.txt")
+
+        n = len(u_df)
+        if any(len(df) != n for df in (v_df, w_df, it_df)):
+            sys.exit(f"Row count mismatch in segment {seg.name}")
 
         disp = np.stack([u_df.u.values, v_df.v.values, w_df.w.values], axis=1).astype(np.float32)
         ints = it_df[["int1", "int2"]].to_numpy(np.float32)
@@ -135,32 +141,74 @@ def prepare_data() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.n
     feats_all = np.vstack(feats_list)
     disp_all = np.vstack(disp_list)
 
+    if not np.isfinite(feats_all).all() or not np.isfinite(disp_all).all():
+        sys.exit("NaN/Inf found in data")
+
     N = feats_all.shape[0]
     print(f"Total timesteps: {N:,}")
-    M = N - SEQ_LENGTH - PRED_HORIZON + 1
+    window_len = SEQ_LENGTH + PRED_HORIZON
+    if num_chunks < 2:
+        sys.exit("num_chunks must be at least 2")
 
-    X_all = np.zeros((M, SEQ_LENGTH, feats_all.shape[1]), dtype=np.float32)
-    y_all = np.zeros((M, PRED_HORIZON, 3), dtype=np.float32)
-    for i in range(M):
-        X_all[i] = feats_all[i : i + SEQ_LENGTH]
-        y_all[i] = disp_all[i + SEQ_LENGTH : i + SEQ_LENGTH + PRED_HORIZON]
+    last_start = N - window_len
+    if last_start < 0:
+        sys.exit(f"Not enough steps for SEQ_LENGTH={SEQ_LENGTH} and HORIZON={PRED_HORIZON}")
 
-    feat_mean = feats_all.mean(axis=0, keepdims=True)
-    feat_std = feats_all.std(axis=0, keepdims=True) + 1e-6
-    X_all = (X_all - feat_mean) / feat_std
+    chunk_edges = np.linspace(0, N, num_chunks + 1, dtype=int)
+    chunk_id = np.searchsorted(chunk_edges[1:], np.arange(N), side="right")
+    starts = np.arange(0, last_start + 1, dtype=int)
+    ends = starts + window_len - 1
+    same_chunk = chunk_id[starts] == chunk_id[ends]
+    valid_starts = starts[same_chunk]
+    if valid_starts.size == 0:
+        sys.exit("No valid windows within chunk boundaries; reduce num_chunks or window length.")
 
-    train_size = int(M * (1 - VAL_SPLIT))
-    X_train, X_val = X_all[:train_size], X_all[train_size:]
-    y_train, y_val = y_all[:train_size], y_all[train_size:]
+    rng = np.random.default_rng(42)
+    chunk_perm = rng.permutation(num_chunks)
+    val_chunks = set(chunk_perm[: max(1, int(num_chunks * VAL_SPLIT))])
+    start_chunk_ids = chunk_id[valid_starts]
+    train_mask = np.array([cid not in val_chunks for cid in start_chunk_ids], dtype=bool)
+    train_starts = valid_starts[train_mask]
+    val_starts = valid_starts[~train_mask]
+    if train_starts.size == 0 or val_starts.size == 0:
+        sys.exit("Empty train/val split after chunk assignment; adjust VAL_SPLIT or num_chunks.")
 
-    np.save(DATASET_DIR / "X_train.npy", X_train)
-    np.save(DATASET_DIR / "y_train.npy", y_train)
-    np.save(DATASET_DIR / "X_val.npy", X_val)
-    np.save(DATASET_DIR / "y_val.npy", y_val)
-    np.savez(NORM_PATH, mean=feat_mean, std=feat_std)
+    X_train = np.zeros((train_starts.size, SEQ_LENGTH, feats_all.shape[1]), dtype=np.float32)
+    y_train = np.zeros((train_starts.size, PRED_HORIZON, 3), dtype=np.float32)
+    for i, start in enumerate(train_starts):
+        X_train[i] = feats_all[start : start + SEQ_LENGTH]
+        y_train[i] = disp_all[start + SEQ_LENGTH : start + window_len]
 
-    print(f"Saved train/validation datasets to '{DATASET_DIR}'")
-    return X_train, y_train, X_val, y_val, feat_mean, feat_std
+    X_val = np.zeros((val_starts.size, SEQ_LENGTH, feats_all.shape[1]), dtype=np.float32)
+    y_val = np.zeros((val_starts.size, PRED_HORIZON, 3), dtype=np.float32)
+    for i, start in enumerate(val_starts):
+        X_val[i] = feats_all[start : start + SEQ_LENGTH]
+        y_val[i] = disp_all[start + SEQ_LENGTH : start + window_len]
+
+    feat_mean = X_train.mean(axis=(0, 1), keepdims=True)
+    feat_std = X_train.std(axis=(0, 1), keepdims=True) + 1e-6
+    X_train = (X_train - feat_mean) / feat_std
+    X_val = (X_val - feat_mean) / feat_std
+
+    if output_norm == "global":
+        y_mean = y_train.mean()
+        y_std = y_train.std() + 1e-6
+    elif output_norm == "channel":
+        y_mean = y_train.mean(axis=(0, 1), keepdims=True)
+        y_std = y_train.std(axis=(0, 1), keepdims=True) + 1e-6
+    else:
+        raise ValueError(f"Unknown output_norm: {output_norm}")
+    y_train = (y_train - y_mean) / y_std
+    y_val = (y_val - y_mean) / y_std
+
+    np.save(dataset_dir / "X_train.npy", X_train)
+    np.save(dataset_dir / "y_train.npy", y_train)
+    np.save(dataset_dir / "X_val.npy", X_val)
+    np.save(dataset_dir / "y_val.npy", y_val)
+    np.savez(norm_path, mean=feat_mean, std=feat_std, y_mean=y_mean, y_std=y_std, output_norm=output_norm)
+
+    print(f"Saved train/validation datasets to '{dataset_dir}'")
+    return X_train, y_train, X_val, y_val, feat_mean, feat_std, y_mean, y_std
 
 
 def run_epoch(
@@ -225,6 +273,7 @@ def evaluate_r2(model: nn.Module, loader: DataLoader, device: torch.device, max_
 
 
 def save_log_row(
+    log_csv_path: Path,
     epoch: int,
     train_loss: float,
     val_loss: float,
@@ -233,8 +282,8 @@ def save_log_row(
     val_r2: Optional[float] = None,
 ) -> None:
     header = ["epoch", "train_loss", "val_loss", "lr", "train_r2", "val_r2"]
-    write_header = not LOG_CSV_PATH.exists()
-    with LOG_CSV_PATH.open("a", newline="") as f:
+    write_header = not log_csv_path.exists()
+    with log_csv_path.open("a", newline="") as f:
         writer = csv.writer(f)
         if write_header:
             writer.writerow(header)
@@ -249,11 +298,46 @@ def save_log_row(
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Train seq2seq surrogate model.")
+    parser.add_argument(
+        "--output-norm",
+        choices=["global", "channel"],
+        default="global",
+        help="Output standardization: global or channel-wise.",
+    )
+    parser.add_argument(
+        "--out-path",
+        default=str(DEFAULT_OUT_PATH),
+        help="Output directory for checkpoints, datasets, and logs.",
+    )
+    parser.add_argument(
+        "--num-chunks",
+        type=int,
+        default=24,
+        help="Number of time chunks for leakage-safe split (windows stay within a chunk).",
+    )
+    args = parser.parse_args()
+
     set_seed()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    X_train, y_train, X_val, y_val, feat_mean, feat_std = prepare_data()
+    out_path = Path(args.out_path)
+    ckpt_dir = out_path / "checkpoints"
+    dataset_dir = out_path / "datasets"
+    model_path = out_path / "seq2seq_surrogate.pt"
+    best_ckpt_path = ckpt_dir / "best_seq2seq.pt"
+    log_csv_path = out_path / "training_log.csv"
+    norm_path = out_path / "norm_stats.npz"
+    for p in (ckpt_dir, dataset_dir):
+        p.mkdir(parents=True, exist_ok=True)
+
+    X_train, y_train, X_val, y_val, feat_mean, feat_std, y_mean, y_std = prepare_data(
+        args.output_norm,
+        dataset_dir,
+        norm_path,
+        args.num_chunks,
+    )
 
     train_ds = TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train))
     val_ds = TensorDataset(torch.from_numpy(X_val), torch.from_numpy(y_val))
@@ -268,9 +352,9 @@ def main() -> None:
     )
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
 
-    if BEST_CKPT_PATH.exists():
-        model.load_state_dict(torch.load(BEST_CKPT_PATH, map_location=device))
-        print(f"Resumed from checkpoint: {BEST_CKPT_PATH}")
+    if best_ckpt_path.exists():
+        model.load_state_dict(torch.load(best_ckpt_path, map_location=device))
+        print(f"Resumed from checkpoint: {best_ckpt_path}")
 
     best_val = math.inf
     start_time = time.time()
@@ -284,7 +368,7 @@ def main() -> None:
         if epoch % R2_EVAL_EVERY == 0:
             train_r2 = evaluate_r2(model, train_loader, device, max_batches=R2_MAX_TRAIN_BATCHES)
             val_r2 = evaluate_r2(model, val_loader, device, max_batches=R2_MAX_VAL_BATCHES)
-        save_log_row(epoch, train_loss, val_loss, lr, train_r2, val_r2)
+        save_log_row(log_csv_path, epoch, train_loss, val_loss, lr, train_r2, val_r2)
 
         line = (
             f"Epoch {epoch:03d} | train_loss={train_loss:.6f} | val_loss={val_loss:.6f} "
@@ -296,22 +380,25 @@ def main() -> None:
 
         if val_loss < best_val:
             best_val = val_loss
-            torch.save(model.state_dict(), BEST_CKPT_PATH)
-            print(f"Saved new best checkpoint to {BEST_CKPT_PATH}")
+            torch.save(model.state_dict(), best_ckpt_path)
+            print(f"Saved new best checkpoint to {best_ckpt_path}")
 
         elapsed = time.time() - start_time
         if elapsed >= MAX_TRAIN_TIME:
             print(f"Time limit reached ({elapsed/3600:.2f} h), stopping early at epoch {epoch}.")
             break
 
-    if BEST_CKPT_PATH.exists():
-        model.load_state_dict(torch.load(BEST_CKPT_PATH, map_location=device))
+    if best_ckpt_path.exists():
+        model.load_state_dict(torch.load(best_ckpt_path, map_location=device))
 
     torch.save(
         {
             "model_state": model.state_dict(),
             "feat_mean": feat_mean,
             "feat_std": feat_std,
+            "y_mean": y_mean,
+            "y_std": y_std,
+            "output_norm": args.output_norm,
             "config": {
                 "seq_length": SEQ_LENGTH,
                 "horizon": PRED_HORIZON,
@@ -319,9 +406,9 @@ def main() -> None:
                 "hidden_dim": 64,
             },
         },
-        MODEL_PATH,
+        model_path,
     )
-    print(f"Saved final model to {MODEL_PATH}")
+    print(f"Saved final model to {model_path}")
 
 
 if __name__ == "__main__":
